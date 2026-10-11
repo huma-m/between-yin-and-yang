@@ -1,127 +1,334 @@
 <!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Stage</title>
-<style>
-  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
-  #wrap {
-    position: absolute; inset: 0; margin: auto; overflow: hidden;
-    aspect-ratio: 1200 / 620;
-    width: min(100vw, calc(100vh * 1200 / 620));
-  }
-  canvas {
-    position: absolute; inset: 0; width: 100%; height: 100%;
-    transition: transform 1.8s cubic-bezier(.65, 0, .35, 1);
-  }
-  #back { transform: translateX(-100%); pointer-events: none; }
-</style>
-</head>
-<body>
-<div id="wrap">
-  <canvas id="stage"></canvas>
-  <canvas id="back"></canvas>
-</div>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>stage</title>
+    <style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        background: #000;
+        overflow: hidden;          /* nothing outside the artboard is ever visible */
+      }
+      #rive-stage {
+        position: fixed;
+        inset: 0;
+        overflow: hidden;
+      }
+      canvas {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        display: block;
+        will-change: transform;
+        transition-property: transform;
+        transition-timing-function: cubic-bezier(0.16, 0.84, 0.44, 1);
+        transition-duration: 1400ms;
+      }
+      /* Backstage waits off-screen to the left and cannot be clicked yet. */
+      #back-canvas {
+        transform: translateX(-100%);
+        pointer-events: none;
+      }
+      /* Only once the slide has finished does backstage take the pointer. */
+      #back-canvas.live {
+        transform: translateX(0);
+        pointer-events: auto;
+        transition: none;
+      }
+      #stage-canvas.swiding { transform: translateX(100%); }
 
-<script src="https://unpkg.com/@rive-app/webgl2"></script>
-<script>
-  // ---- settings: change these if your names differ -----------------------
-  const RIV_FILE       = 'stage.riv';   // the signed build, next to this file
-  const STAGE_ARTBOARD = 'Main';
-  const STAGE_SM       = 'Game';
-  const BACK_ARTBOARD  = 'backstage';
-  const BACK_SM        = '';            // leave empty to use its first state machine
-  const STAGE_PROP     = 'stage';       // view model number that reaches 4 at the end
-  const SOLVED_VALUE   = 4;
-  const SWITCH_DELAY_MS = 3000;         // wait for the curtains to close before sliding
-  // -------------------------------------------------------------------------
+      #rive-status {
+        position: fixed;
+        left: 0; right: 0; bottom: 0;
+        padding: 10px 14px;
+        font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+        color: #e6e6e6;
+        background: rgba(0, 0, 0, 0.72);
+      }
+      #rive-status[hidden] { display: none; }
+      #rive-status.error { background: rgba(120, 0, 0, 0.85); }
+      #debug {
+        position: fixed;
+        left: 8px; top: 8px;
+        z-index: 10;
+        font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+        color: #9ef79e;
+        background: rgba(0, 0, 0, 0.6);
+        padding: 6px 9px;
+        white-space: pre;
+      }
+      #debug[hidden] { display: none; }
+    </style>
+  </head>
+  <body>
+    <div id="rive-stage">
+      <canvas id="stage-canvas"></canvas>
+      <canvas id="back-canvas"></canvas>
+    </div>
 
-  const stageCanvas = document.getElementById('stage');
-  const backCanvas  = document.getElementById('back');
-  const layout = new rive.Layout({ fit: rive.Fit.Contain, alignment: rive.Alignment.Center });
+    <div id="debug" hidden></div>
 
-  let switched = false;
+    <div id="rive-status" role="status" aria-live="polite">
+      <p class="message">Loading</p>
+    </div>
 
-  function sizeCanvas(c, r) {
-    const dpr = window.devicePixelRatio || 1;
-    c.width  = c.clientWidth * dpr;
-    c.height = c.clientHeight * dpr;
-    if (r) r.resizeDrawingSurfaceToCanvas();
-  }
+    <!-- Same runtime package and version specifier the rive.to player uses.
+         Currently resolves to @rive-app/webgl2 2.44.2. Pin it here if you
+         ever want the deployed page to be byte-reproducible. -->
+    <script src="https://cdn.jsdelivr.net/npm/@rive-app/webgl2@2.x.x/rive.js"></script>
 
-  sizeCanvas(stageCanvas);
-  const stageRive = new rive.Rive({
-    src: RIV_FILE,
-    canvas: stageCanvas,
-    artboard: STAGE_ARTBOARD,
-    stateMachines: STAGE_SM,
-    autoplay: true,
-    autoBind: true,
-    layout,
-    onLoad: () => {
-      stageRive.resizeDrawingSurfaceToCanvas();
-      watchStage();
-    },
-  });
+    <script>
+      (function () {
+        'use strict';
 
-  // Poll the stage property (simple and robust).
-  function watchStage() {
-    const timer = setInterval(() => {
-      if (switched) { clearInterval(timer); return; }
-      try {
-        const vmi = stageRive.viewModelInstance;
-        const prop = vmi && vmi.number(STAGE_PROP);
-        if (prop && prop.value >= SOLVED_VALUE) {
-          clearInterval(timer);
-          setTimeout(goBackstage, SWITCH_DELAY_MS);
+        // ------------------------------------------------------------------
+        // Configuration
+        // ------------------------------------------------------------------
+        var RUNTIME_SRC = 'stage.riv';
+
+        // 'cover' fills the viewport and crops the artboard's overflow, so
+        // nothing outside the artboard is ever visible. Swap to 'contain' to
+        // see the whole artboard with letterbox bars instead.
+        var FIT = 'cover';
+        var ALIGNMENT = 'center';
+
+        // Same construction as the rive.to player.
+        var ENABLE_GPU_CANVAS = true;
+        var AUTOPLAY = true;
+        var AUTO_BIND = true;
+        var ENABLE_MULTI_TOUCH = true;
+
+        var STAGE_ARTBOARD = 'Main';
+        var STAGE_STATE_MACHINE = 'Game';          // Main's default state machine
+
+        var BACK_ARTBOARD = 'backstage';
+        var BACK_STATE_MACHINE = 'State Machine 1'; // backstage's default state machine
+
+        // GameState view model property that drives the whole flow.
+        var STAGE_PROPERTY = 'stage';
+        var SLIDE_AT = 4;          // stage 4 == curtains closed
+
+        var SLIDE_MS = 1400;       // must match the CSS transition-duration
+
+        // ------------------------------------------------------------------
+        // State
+        // ------------------------------------------------------------------
+        var riveFile = null;
+        var stageRive = null;
+        var backRive = null;
+        var stageProperty = null;
+        var sliding = false;
+        var finished = false;
+        var params = new URLSearchParams(window.location.search);
+        var debugOn = params.has('debug');
+
+        var stageCanvas = document.getElementById('stage-canvas');
+        var backCanvas = document.getElementById('back-canvas');
+        var statusEl = document.getElementById('rive-status');
+        var debugEl = document.getElementById('debug');
+
+        if (debugOn) { debugEl.hidden = false; }
+
+        function log(msg) {
+          if (!debugOn) { return; }
+          debugEl.textContent += msg + '\n';
+          console.log('[stage]', msg);
         }
-      } catch (e) { /* property not ready yet */ }
-    }, 200);
-  }
 
-  function goBackstage() {
-    if (switched) return;
-    switched = true;
-    stageCanvas.style.pointerEvents = 'none';
-
-    sizeCanvas(backCanvas);
-    const backOptions = {
-      src: RIV_FILE,
-      canvas: backCanvas,
-      artboard: BACK_ARTBOARD,
-      autoplay: true,
-      autoBind: true,
-      layout,
-      onLoad: () => {
-        backRive.resizeDrawingSurfaceToCanvas();
-        if (!BACK_SM && backRive.stateMachineNames.length) {
-          backRive.play(backRive.stateMachineNames[0]);
+        function showError(msg) {
+          statusEl.hidden = false;
+          statusEl.classList.add('error');
+          statusEl.querySelector('.message').textContent = msg;
+          log('ERROR: ' + msg);
         }
-        // Slide: stage out to the right, backstage in from the left.
-        requestAnimationFrame(() => {
-          stageCanvas.style.transform = 'translateX(100%)';
-          backCanvas.style.transform  = 'translateX(0)';
+
+        function hideStatus() { statusEl.hidden = true; }
+
+        function wait(ms) {
+          return new Promise(function (resolve) { setTimeout(resolve, ms); });
+        }
+
+        // ------------------------------------------------------------------
+        // Instance construction - mirrors hosted.js's $()/Q() options exactly
+        // ------------------------------------------------------------------
+        function instanceOptions(canvas, artboard, stateMachine, onLoad, onLoadError) {
+          return {
+            canvas: canvas,
+            artboard: artboard,              // -> runtime artboardByName(name)
+            stateMachine: stateMachine,      // -> runtime plays this state machine
+            autoplay: AUTOPLAY,
+            autoBind: AUTO_BIND,             // binds the artboard's view model instance
+            enableGPUCanvas: ENABLE_GPU_CANVAS,
+            enableMultiTouch: ENABLE_MULTI_TOUCH,
+            layout: new rive.Layout({ fit: FIT, alignment: ALIGNMENT }),
+            onLoad: onLoad,
+            onLoadError: onLoadError
+          };
+        }
+
+        // Prefer the already-loaded RiveFile (what the rive.to player does).
+        // If the runtime ever refuses a second instance from one file, fall
+        // back to letting the runtime load the source itself.
+        function createInstance(opts, useSharedFile) {
+          return new Promise(function (resolve, reject) {
+            var config = Object.assign({}, opts);
+            if (useSharedFile) { config.riveFile = riveFile; }
+            else { config.src = RUNTIME_SRC; }
+
+            var settled = false;
+            var instance = null;
+
+            config.onLoad = function () {
+              if (settled) { return; }
+              settled = true;
+              resolve(instance);
+            };
+            config.onLoadError = function (e) {
+              if (settled) { return; }
+              if (useSharedFile) {
+                log('shared RiveFile did not produce an instance; retrying with src');
+                createInstance(opts, false).then(resolve, reject);
+                return;
+              }
+              settled = true;
+              reject(e);
+            };
+
+            instance = new rive.Rive(config);
+          });
+        }
+
+        // ------------------------------------------------------------------
+        // Boot
+        // ------------------------------------------------------------------
+        async function boot() {
+          try {
+            log('runtime loaded; fetching ' + RUNTIME_SRC);
+            riveFile = new rive.RiveFile({ src: RUNTIME_SRC, enableGPUCanvas: ENABLE_GPU_CANVAS });
+            await riveFile.init();
+            log('file ready, fit=' + FIT);
+
+            stageRive = new rive.Rive(Object.assign(
+              { riveFile: riveFile },
+              instanceOptions(stageCanvas, STAGE_ARTBOARD, STAGE_STATE_MACHINE,
+                              function () {
+                                hideStatus();
+                                log('stage loaded');
+                                watchStage();
+                              },
+                              function (e) { showError('Stage failed to load: ' + e); })));
+
+            window.addEventListener('resize', onResize);
+
+            if (params.has('test')) {
+              log('?test - sliding in 1s');
+              setTimeout(runSlide, 1000);
+            }
+          } catch (err) {
+            showError('Could not load ' + RUNTIME_SRC + ' (' + err + ')');
+          }
+        }
+
+        // ------------------------------------------------------------------
+        // Watch the stage view model property
+        //
+        // Read once per animation frame rather than subscribing to change
+        // events: it is one property read, and it avoids depending on the
+        // property-level event API.
+        // ------------------------------------------------------------------
+        function watchStage() {
+          var vmi = stageRive && stageRive.viewModelInstance;
+          if (!vmi) { log('no viewModelInstance on the stage'); return; }
+          stageProperty = vmi.number(STAGE_PROPERTY);
+          if (!stageProperty) {
+            log('view model property "' + STAGE_PROPERTY + '" not found');
+            return;
+          }
+          log('watching "' + STAGE_PROPERTY + '" (currently ' + stageProperty.value + ')');
+          tick();
+
+          function tick() {
+            if (sliding || finished || !stageProperty) { return; }
+            var v = stageProperty.value;
+            if (debugOn && Math.floor(v) !== tick.last) {
+              tick.last = Math.floor(v);
+              debugEl.textContent = 'stage = ' + v;
+            }
+            if (v >= SLIDE_AT) {
+              log('stage reached ' + v + ' -> slide');
+              runSlide();
+              return;
+            }
+            requestAnimationFrame(tick);
+          }
+        }
+
+        // ------------------------------------------------------------------
+        // The slide
+        // ------------------------------------------------------------------
+        async function runSlide() {
+          if (sliding || finished) { return; }
+          sliding = true;
+          stopWatching();
+          log('slide: loading backstage');
+
+          try {
+            // Backstage is its own artboard with its own state machine and its
+            // own view model, so its door listeners get real pointer input.
+            backRive = await createInstance(instanceOptions(
+              backCanvas, BACK_ARTBOARD, BACK_STATE_MACHINE,
+              function () { log('backstage loaded'); },
+              function (e) { log('backstage load error: ' + e); }), true);
+          } catch (e) {
+            log('backstage would not load: ' + e);
+            sliding = false;
+            return;
+          }
+
+          // Both are loaded and on screen. Start the CSS transition:
+          // the stage leaves to the right, backstage enters from the left.
+          stageCanvas.classList.add('sliding');
+          backCanvas.style.transform = 'translateX(0)';
+          log('slide: ' + SLIDE_MS + 'ms');
+
+          await wait(SLIDE_MS + 120);
+
+          // Hand the pointer over and destroy the stage completely.
+          stageRive.cleanup();
+          stageRive = null;
+          if (stageCanvas.parentNode) { stageCanvas.parentNode.removeChild(stageCanvas); }
+
+          backCanvas.classList.add('live');
+          backCanvas.style.transform = '';
+          // Re-fit now that the off-screen transform is gone.
+          if (backRive) { backRive.resizeDrawingSurfaceToCanvas(); }
+          finished = true;
+          sliding = false;
+          log('done - backstage is live');
+        }
+
+        function stopWatching() {
+          // The tick loop bails out on its own once sliding/finished is set;
+          // nothing else to tear down.
+        }
+
+        // ------------------------------------------------------------------
+        function onResize() {
+          if (stageRive) { stageRive.resizeDrawingSurfaceToCanvas(); }
+          if (backRive) { backRive.resizeDrawingSurfaceToCanvas(); }
+        }
+
+        window.addEventListener('error', function (ev) {
+          showError('Runtime error: ' + (ev.message || ev));
         });
-      },
-    };
-    if (BACK_SM) backOptions.stateMachines = BACK_SM;
-    const backRive = new rive.Rive(backOptions);
 
-    // When the slide ends, give backstage the clicks and drop the stage.
-    backCanvas.addEventListener('transitionend', () => {
-      backCanvas.style.pointerEvents = 'auto';
-      stageRive.cleanup();
-      stageCanvas.remove();
-    }, { once: true });
-  }
-
-  window.addEventListener('resize', () => {
-    sizeCanvas(stageCanvas, stageRive);
-  });
-
-  // Test shortcut: open index.html?test to trigger the slide after 1 second.
-  if (location.search.includes('test')) setTimeout(goBackstage, 1000);
-</script>
-</body>
+        boot();
+      })();
+    </script>
+  </body>
 </html>

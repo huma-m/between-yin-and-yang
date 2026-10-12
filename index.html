@@ -17,14 +17,18 @@
         inset: 0;
         overflow: hidden;
       }
+      /* Sizing mirrors the rive.to player: a block-level canvas at 100%/100% of
+         a fixed, inset:0 container. No `will-change: transform` here - it
+         promotes the canvas onto its own compositing layer, which is a likely
+         contributor to the canvas rasterising soft before the first
+         resizeDrawingSurfaceToCanvas(). The slide transition still works
+         without it. */
       canvas {
         position: absolute;
-        top: 0;
-        left: 0;
+        inset: 0;
         width: 100%;
         height: 100%;
         display: block;
-        will-change: transform;
         transition-property: transform;
         transition-timing-function: cubic-bezier(0.16, 0.84, 0.44, 1);
         transition-duration: 1400ms;
@@ -154,6 +158,74 @@
         }
 
         // ------------------------------------------------------------------
+        // Canvas sizing - now follows the rive.to player's startup order.
+        //
+        // hosted.js does, in this order:
+        //   1. construct Rive with layout: new rive.Layout({fit, alignment})
+        //   2. install a ResizeObserver on the canvas, no-op until it has loaded
+        //   3. in onLoad: register the instance, then call
+        //      resizeDrawingSurfaceToCanvas() as the last statement
+        //   4. at boot, te() arms a devicePixelRatio matchMedia that resizes
+        //      every instance and re-arms the query
+        // This page was missing step 3, which is why it stayed soft until the
+        // first window resize, and it had no step 2 or 4 at all.
+        // ------------------------------------------------------------------
+        var stageLoaded = false;
+        var dprQuery = null;
+        var liveInstances = [];
+
+        // Registered from each instance's own onLoad, because at that point the
+        // instance exists but the `await` that assigns it to a global has not
+        // run yet.
+        function registerInstance(inst) {
+          if (inst && liveInstances.indexOf(inst) === -1) { liveInstances.push(inst); }
+        }
+
+        function unregisterInstance(inst) {
+          var i = liveInstances.indexOf(inst);
+          if (i !== -1) { liveInstances.splice(i, 1); }
+        }
+
+        function fitInstances() {
+          for (var i = 0; i < liveInstances.length; i++) {
+            liveInstances[i].resizeDrawingSurfaceToCanvas();
+          }
+        }
+
+        // Sizing again right after load, then after the first animation frame,
+        // covers the case where the container's box settles late (fonts,
+        // scrollbars, first paint). Harmless if the size has not changed.
+        function settleSizing() {
+          fitInstances();
+          requestAnimationFrame(function () {
+            fitInstances();
+            requestAnimationFrame(fitInstances);
+          });
+        }
+
+        // te() in hosted.js: watch devicePixelRatio so a browser zoom or a move
+        // to a monitor with a different scale re-sizes every instance, then
+        // re-arm the query so it keeps working. Stable handler reference so the
+        // old listener is actually removed.
+        function onDevicePixelRatioChange() {
+          fitInstances();
+          armDevicePixelRatioWatcher();
+        }
+
+        function armDevicePixelRatioWatcher() {
+          if (typeof window.matchMedia !== 'function') { return; }
+          if (dprQuery) {
+            if (dprQuery.removeEventListener) { dprQuery.removeEventListener('change', onDevicePixelRatioChange); }
+            else if (dprQuery.removeListener) { dprQuery.removeListener(onDevicePixelRatioChange); }
+          }
+          var dpr = window.devicePixelRatio || 1;
+          dprQuery = window.matchMedia(
+            '(min-resolution: ' + (dpr - 0.001) + 'dppx) and (max-resolution: ' + (dpr + 0.001) + 'dppx)');
+          if (dprQuery.addEventListener) { dprQuery.addEventListener('change', onDevicePixelRatioChange); }
+          else if (dprQuery.addListener) { dprQuery.addListener(onDevicePixelRatioChange); }
+        }
+
+        // ------------------------------------------------------------------
         // Instance construction - mirrors hosted.js's $()/Q() options exactly
         // ------------------------------------------------------------------
         function instanceOptions(canvas, artboard, stateMachine, onLoad, onLoadError) {
@@ -183,13 +255,22 @@
             var settled = false;
             var instance = null;
 
+            // Keep the caller's onLoad/onLoadError - they are overwritten below.
+            var userOnLoad = config.onLoad;
+            var userOnLoadError = config.onLoadError;
+
             config.onLoad = function () {
               if (settled) { return; }
               settled = true;
+              // Called with the instance so the caller can register it. At this
+              // moment the surrounding `await` has not yet assigned it to a
+              // global, so sizing must not depend on that assignment.
+              if (userOnLoad) { userOnLoad(instance); }
               resolve(instance);
             };
             config.onLoadError = function (e) {
               if (settled) { return; }
+              if (userOnLoadError) { userOnLoadError(e); }
               if (useSharedFile) {
                 log('shared RiveFile did not produce an instance; retrying with src');
                 createInstance(opts, false).then(resolve, reject);
@@ -218,12 +299,31 @@
               instanceOptions(stageCanvas, STAGE_ARTBOARD, STAGE_STATE_MACHINE,
                               function () {
                                 hideStatus();
+                                stageLoaded = true;
                                 log('stage loaded');
+                                registerInstance(stageRive);
                                 watchStage();
+                                // hosted.js ends its onLoad with exactly this
+                                // call. It is what makes the first frame sharp.
+                                settleSizing();
                               },
                               function (e) { showError('Stage failed to load: ' + e); })));
 
-            window.addEventListener('resize', onResize);
+            // ResizeObserver on the container. A window resize listener misses
+            // container changes that are not window changes, and fired only
+            // once the user happened to resize - which is what left this page
+            // blurry. Observed box size ignores transforms, so the slide's
+            // translateX cannot make this misfire or restart the transition.
+            if (typeof ResizeObserver === 'function') {
+              var ro = new ResizeObserver(function () {
+                if (stageLoaded) { fitInstances(); }
+              });
+              ro.observe(document.getElementById('rive-stage'));
+            }
+            // Fallback for browsers without ResizeObserver, same as hosted.js.
+            window.addEventListener('resize', fitInstances);
+            window.addEventListener('load', settleSizing);
+            armDevicePixelRatioWatcher();
 
             if (params.has('test')) {
               log('?test - sliding in 1s');
@@ -282,7 +382,15 @@
             // own view model, so its door listeners get real pointer input.
             backRive = await createInstance(instanceOptions(
               backCanvas, BACK_ARTBOARD, BACK_STATE_MACHINE,
-              function () { log('backstage loaded'); },
+              function (inst) {
+                log('backstage loaded');
+                registerInstance(inst);
+                // Size backstage BEFORE the transition starts. Its canvas is
+                // still translated off-screen here; transforms do not affect
+                // the measured content box, so this does not disturb the slide
+                // and the slide does not disturb the sizing.
+                settleSizing();
+              },
               function (e) { log('backstage load error: ' + e); }), true);
           } catch (e) {
             log('backstage would not load: ' + e);
@@ -299,6 +407,7 @@
           await wait(SLIDE_MS + 120);
 
           // Hand the pointer over and destroy the stage completely.
+          unregisterInstance(stageRive);
           stageRive.cleanup();
           stageRive = null;
           if (stageCanvas.parentNode) { stageCanvas.parentNode.removeChild(stageCanvas); }
@@ -306,7 +415,7 @@
           backCanvas.classList.add('live');
           backCanvas.style.transform = '';
           // Re-fit now that the off-screen transform is gone.
-          if (backRive) { backRive.resizeDrawingSurfaceToCanvas(); }
+          fitInstances();
           finished = true;
           sliding = false;
           log('done - backstage is live');
@@ -315,12 +424,6 @@
         function stopWatching() {
           // The tick loop bails out on its own once sliding/finished is set;
           // nothing else to tear down.
-        }
-
-        // ------------------------------------------------------------------
-        function onResize() {
-          if (stageRive) { stageRive.resizeDrawingSurfaceToCanvas(); }
-          if (backRive) { backRive.resizeDrawingSurfaceToCanvas(); }
         }
 
         window.addEventListener('error', function (ev) {
